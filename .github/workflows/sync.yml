@@ -1,36 +1,59 @@
-name: Upstream Sync
+name: 每日同步上游代码
+
+on:
+  schedule:
+    # GitHub 使用 UTC：每天 20:17 UTC，即北京时间次日 04:17。
+    - cron: '17 20 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-on:
-  schedule:
-    - cron: "0 4 * * *" # At 12PM UTC+8
-  workflow_dispatch:
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    name: 同步上游主分支
+    if: github.repository == 'xiaonan-37021/api-enhanced'
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
-
+    timeout-minutes: 10
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
-        uses: actions/checkout@v6
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
+      - name: 获取上游更新并保留本仓库修改
+        uses: actions/github-script@v7
         with:
-          upstream_sync_repo: NeteaseCloudMusicApiEnhanced/api-enhanced
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sync check
-        if: failure()
-        run: |
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-          exit 1
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            try {
+              // 使用 GitHub 官方同步接口合并父仓库更新，不强制覆盖本仓库。
+              const { data } = await github.rest.repos.mergeUpstream({
+                owner,
+                repo,
+                branch: 'main'
+              });
+              const types = {
+                none: '已是最新，无需更新',
+                'fast-forward': '已快进同步上游更新',
+                merge: '已合并上游更新并保留本仓库提交'
+              };
+              const result = types[data.merge_type] || '上游同步完成';
+              core.info(result);
+              await core.summary
+                .addHeading('上游代码同步结果')
+                .addRaw(`上游仓库：NeteaseCloudMusicApiEnhanced/api-enhanced\n\n`)
+                .addRaw(`目标分支：main\n\n`)
+                .addRaw(`执行结果：${result}\n\n`)
+                .addRaw(`合并提交：${data.merge_commit_sha || '无新增提交'}\n`)
+                .write();
+            } catch (error) {
+              const status = error.status || '未知';
+              const message = status === 409 || status === 422
+                ? '同步失败：可能存在合并冲突，请检查上游变化并手动处理；本仓库未被强制覆盖。'
+                : status === 403
+                  ? '同步失败：GitHub 拒绝操作，请检查 Actions 写入权限；若上游修改了工作流，可能需要手动同步。'
+                  : `同步失败：GitHub 接口返回状态码 ${status}，请查看运行日志后重试。`;
+              core.setFailed(message);
+              await core.summary.addHeading('上游代码同步失败').addRaw(message).write();
+            }
